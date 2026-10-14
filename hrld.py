@@ -1,29 +1,75 @@
 #!/usr/bin/env python3
 """hrld: HRL Hyper OS Feudal Agent Daemon + Interactive macOS Desktop (stdlib only)."""
-import http.server, json, os, pathlib, platform, shlex, subprocess, sys, urllib.parse, webbrowser
+import http.server, json, os, pathlib, platform, shlex, sqlite3, subprocess, sys, urllib.parse, webbrowser
 
 PORT = int(os.environ.get("HRL_PORT", "8765"))
 Q_FILE = pathlib.Path(__file__).with_name("q_table.json")
+DB_FILE = pathlib.Path(__file__).with_name("q_table.db")
 
-SUBGOALS = {
-    "system_status": ["uname", "-a"],
-    "list_files": ["ls", "-la"],
-    "disk_usage": ["df", "-h"],
-    "memory_top": ["vm_stat"] if platform.system() == "Darwin" else ["free", "-h"],
-    "network_info": ["ifconfig"] if platform.system() == "Darwin" else ["ip", "addr"],
-    "whoami_uptime": ["uptime"],
-}
+# Platform-specific native command fallbacks
+if platform.system() == "Darwin":
+    SUBGOALS = {
+        "system_status": ["uname", "-a"],
+        "list_files": ["ls", "-la"],
+        "disk_usage": ["df", "-h"],
+        "memory_top": ["vm_stat"],
+        "network_info": ["ifconfig"],
+        "whoami_uptime": ["uptime"],
+    }
+elif platform.system() == "Windows":
+    SUBGOALS = {
+        "system_status": ["cmd", "/c", "ver"],
+        "list_files": ["cmd", "/c", "dir"],
+        "disk_usage": ["powershell", "-NoProfile", "-Command", "Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free"],
+        "memory_top": ["powershell", "-NoProfile", "-Command", "Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 10 ProcessName, CPU, WorkingSet64"],
+        "network_info": ["ipconfig"],
+        "whoami_uptime": ["whoami"],
+    }
+else:
+    SUBGOALS = {
+        "system_status": ["uname", "-a"],
+        "list_files": ["ls", "-la"],
+        "disk_usage": ["df", "-h"],
+        "memory_top": ["free", "-h"],
+        "network_info": ["ip", "addr"],
+        "whoami_uptime": ["uptime"],
+    }
 
-# ponytail: JSON file persistence for tabular Q-table; upgrade to SQLite if concurrent writers are added
+# Tabular Q-table with SQLite persistence and JSON file fallback
 Q_TABLE = {k: 0.0 for k in SUBGOALS}
-if Q_FILE.exists():
+
+def init_db():
+    if Q_FILE.exists():
+        try:
+            Q_TABLE.update(json.loads(Q_FILE.read_text()))
+        except Exception:
+            pass
     try:
-        Q_TABLE.update(json.loads(Q_FILE.read_text()))
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS q_values (subgoal TEXT PRIMARY KEY, score REAL)")
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM q_values")
+            if cur.fetchone()[0] == 0:
+                for k, v in Q_TABLE.items():
+                    cur.execute("INSERT OR REPLACE INTO q_values (subgoal, score) VALUES (?, ?)", (k, v))
+                conn.commit()
+            else:
+                for row in cur.execute("SELECT subgoal, score FROM q_values"):
+                    Q_TABLE[row[0]] = float(row[1])
     except Exception:
         pass
 
+init_db()
+
 
 def save_q():
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            for k, v in Q_TABLE.items():
+                conn.execute("INSERT OR REPLACE INTO q_values (subgoal, score) VALUES (?, ?)", (k, v))
+            conn.commit()
+    except Exception:
+        pass
     Q_FILE.write_text(json.dumps(Q_TABLE, indent=2))
 
 
@@ -36,12 +82,12 @@ def update_q(subgoal: str, reward: float, lr: float = 0.25) -> float:
 def manager_select(goal: str) -> str:
     g = goal.lower()
     keyword_map = {
-        "status": "system_status", "uname": "system_status", "kernel": "system_status",
+        "status": "system_status", "uname": "system_status", "kernel": "system_status", "os": "system_status",
         "file": "list_files", "ls": "list_files", "dir": "list_files", "finder": "list_files",
         "disk": "disk_usage", "storage": "disk_usage", "df": "disk_usage",
-        "mem": "memory_top", "ram": "memory_top", "ps": "memory_top",
+        "mem": "memory_top", "ram": "memory_top", "ps": "memory_top", "top": "memory_top",
         "net": "network_info", "ip": "network_info", "wifi": "network_info",
-        "up": "whoami_uptime", "time": "whoami_uptime",
+        "up": "whoami_uptime", "time": "whoami_uptime", "whoami": "whoami_uptime", "user": "whoami_uptime",
     }
     matched = {v for k, v in keyword_map.items() if k in g} | {s for s in SUBGOALS if s in g}
     candidates = list(matched) or list(SUBGOALS.keys())
@@ -54,12 +100,12 @@ def worker_exec(subgoal: str, dry_run: bool = False) -> dict:
         return {"ok": False, "reward": -1.0, "error": "unknown subgoal", "q_table": Q_TABLE}
     if dry_run:
         q = update_q(subgoal, 1.0)
-        return {"ok": True, "subgoal": subgoal, "cmd": shlex.join(cmd), "out": "(dry-run)", "reward": 1.0, "q": q, "q_table": Q_TABLE}
+        return {"ok": True, "subgoal": subgoal, "cmd": shlex.join(cmd) if hasattr(shlex, 'join') else ' '.join(cmd), "out": "(dry-run)", "reward": 1.0, "q": q, "q_table": Q_TABLE}
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
     r = 1.0 if proc.returncode == 0 else -1.0
     q = update_q(subgoal, r)
     out = (proc.stdout or proc.stderr).strip()
-    return {"ok": proc.returncode == 0, "subgoal": subgoal, "cmd": shlex.join(cmd), "out": out[:3000], "reward": r, "q": q, "q_table": Q_TABLE}
+    return {"ok": proc.returncode == 0, "subgoal": subgoal, "cmd": shlex.join(cmd) if hasattr(shlex, 'join') else ' '.join(cmd), "out": out[:3000], "reward": r, "q": q, "q_table": Q_TABLE}
 
 
 def handle_goal(payload: dict) -> dict:
@@ -91,6 +137,22 @@ def run_shell(cmd_str: str) -> dict:
         return {"ok": proc.returncode == 0, "out": ((proc.stdout or "") + (proc.stderr or "")).strip()[:3000]}
     except Exception as e:
         return {"ok": False, "out": str(e)}
+
+
+def free_port(port: int):
+    """Safely terminate any lingering process listening on the specified port."""
+    if platform.system() == "Windows":
+        try:
+            res = subprocess.run(f"netstat -ano | findstr :{port}", shell=True, capture_output=True, text=True)
+            for line in res.stdout.strip().splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and "LISTENING" in parts:
+                    pid = parts[-1]
+                    subprocess.run(f"taskkill /PID {pid} /F", shell=True, capture_output=True)
+        except Exception:
+            pass
+    else:
+        subprocess.run(f"lsof -ti tcp:{port} | xargs kill -9", shell=True, stderr=subprocess.DEVNULL)
 
 
 DESKTOP_HTML = """<!DOCTYPE html>
@@ -147,14 +209,14 @@ DESKTOP_HTML = """<!DOCTYPE html>
       <span class="dot red" onclick="hideWin('win-term')"></span>
       <span class="dot yellow" onclick="hideWin('win-term')"></span>
       <span class="dot green" onclick="maxWin('win-term')"></span>
-      <span class="w-title">POSIX / HRL Hybrid Terminal</span>
+      <span class="w-title">POSIX / Windows Hybrid Terminal</span>
     </div>
     <div class="w-body" id="termOut">Booting HRL Hyper OS...</div>
     <div class="toolbar">
       <span style="font-size:11px;color:#aaa;">Subgoal: <strong id="lastSubgoal" style="color:#fff;">system_status</strong></span>
       <button class="btn" onclick="sendReward(1)" title="Reinforce subgoal (+1)">👍 Reward +1</button>
       <button class="btn" onclick="sendReward(-1)" title="Penalize subgoal (-1)">👎 Penalize -1</button>
-      <input class="sh-input" id="shInput" placeholder="$ run POSIX command (Enter)..." />
+      <input class="sh-input" id="shInput" placeholder="$ run shell command (Enter)..." />
     </div>
   </div>
 
@@ -175,7 +237,7 @@ DESKTOP_HTML = """<!DOCTYPE html>
       <span class="dot red" onclick="hideWin('win-q')"></span>
       <span class="dot yellow" onclick="hideWin('win-q')"></span>
       <span class="dot green" onclick="maxWin('win-q')"></span>
-      <span class="w-title">Feudal HRL Manager — Persistent Subgoal Q-Table (q_table.json)</span>
+      <span class="w-title">Feudal HRL Manager — Persistent Subgoal Q-Table (q_table.db / q_table.json)</span>
     </div>
     <div class="w-body" id="qOut"></div>
   </div>
@@ -198,7 +260,7 @@ DESKTOP_HTML = """<!DOCTYPE html>
   function maxWin(id) {
     const w = document.getElementById(id); focusWin(id);
     if (w.dataset.max === '1') { w.style.top = w.dataset.t; w.style.left = w.dataset.l; w.style.width = w.dataset.w; w.style.height = w.dataset.h; w.dataset.max = '0'; }
-    else { w.dataset.t = w.style.top; w.dataset.l = w.style.left; w.style.w = w.style.width; w.style.h = w.style.height; w.style.top = '34px'; w.style.left = '10px'; w.style.width = 'calc(100vw - 20px)'; w.style.height = 'calc(100vh - 108px)'; w.dataset.max = '1'; }
+    else { w.dataset.t = w.style.top; w.dataset.l = w.style.left; w.dataset.w = w.style.width; w.dataset.h = w.style.height; w.style.top = '34px'; w.style.left = '10px'; w.style.width = 'calc(100vw - 20px)'; w.style.height = 'calc(100vh - 108px)'; w.dataset.max = '1'; }
   }
   function dragStart(e, id) {
     if (e.target.classList.contains('dot')) return;
@@ -307,19 +369,19 @@ def self_check():
     assert res1["ok"] and res1["subgoal"] == "disk_usage", res1
     q_before = Q_TABLE["disk_usage"]
     q_after = update_q("disk_usage", -1.0)
-    assert q_after < q_before and Q_FILE.exists(), (q_before, q_after)
+    assert q_after < q_before and (Q_FILE.exists() or DB_FILE.exists()), (q_before, q_after)
     files = list_dir(".")
     assert "cwd" in files and len(files["items"]) >= 1, files
     sh = run_shell("echo hrl_ok")
-    assert sh["ok"] and sh["out"] == "hrl_ok", sh
-    print("self-check passed: Finder items =", len(files["items"]), "| Q saved to", Q_FILE.name)
+    assert sh["ok"] and "hrl_ok" in sh["out"], sh
+    print("self-check passed: Finder items =", len(files["items"]), "| Q saved to", Q_FILE.name, "&", DB_FILE.name)
 
 
 if __name__ == "__main__":
     if "--check" in sys.argv:
         self_check()
         sys.exit(0)
-    subprocess.run(f"lsof -ti tcp:{PORT} | xargs kill -9", shell=True, stderr=subprocess.DEVNULL)
+    free_port(PORT)
     http.server.ThreadingHTTPServer.allow_reuse_address = True
     url = f"http://127.0.0.1:{PORT}"
     print(f"Booting HRL Hyper OS Live Desktop at {url} (Ctrl+C to stop)")
